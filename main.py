@@ -1,34 +1,15 @@
-import os
-import re
-import json
+import streamlit as st
 import pdfplumber
-from flask import Flask, request, jsonify
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from googleapiclient.discovery import build
+import re
+import openpyxl
+from io import BytesIO
 
-app = Flask(__name__)
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="DBR Auto-Tool", layout="centered")
 
-# --- CONFIGURATION ---
-MASTER_SHEET_ID = "1cY6O1tDlkCRaTE9eYlqZ-culLKR2Y6Q2uHzmcuJ5Gg4"
-TARGET_TAB_NAME = "INPUT" 
-
-# --- AUTHENTICATION ---
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-
-def get_creds():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-    if not creds_json:
-        raise ValueError("GOOGLE_CREDENTIALS environment variable not set")
-    try:
-        creds_dict = json.loads(creds_json)
-        return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    except Exception as e:
-        raise ValueError(f"Invalid GOOGLE_CREDENTIALS JSON: {str(e)}")
-
-# --- MAPPING LOGIC ---
+# --- 1. MAPPING LOGIC ---
 def get_product_code(text):
-    t = text.lower()
+    t = text.lower() if text else ""
     if "card" in t: return 8
     if "auto" in t or "car" in t or "lease" in t or "ijara" in t: return 2
     if "personal" in t or "finance" in t or "micro" in t: return 6
@@ -36,30 +17,24 @@ def get_product_code(text):
     return text
 
 def get_term_code(text):
-    t = text.lower()
+    t = text.lower() if text else ""
     if "card" in t or "running" in t or "cash line" in t: return "E"
     return "T"
 
-# --- PDF PARSER (YOUR EXACT LOGIC) ---
-def parse_tasdeeq_pdf(file_stream):
+# --- 2. PDF PARSER ---
+def parse_tasdeeq_pdf(file_obj):
     data = {
-        "Name": "[[ NOT PROVIDED ]]",
-        "CNIC": "[[ NOT PROVIDED ]]",
-        "DOB": "[[ NOT PROVIDED ]]",
-        "Loans": []
+        "Name": "", "CNIC": "", "DOB": "", "Loans": []
     }
-
     try:
-        with pdfplumber.open(file_stream) as pdf:
+        with pdfplumber.open(file_obj) as pdf:
             full_text = ""
             for page in pdf.pages:
                 full_text += page.extract_text() + "\n"
 
-            # --- PERSONAL INFO ---
+            # --- Personal Info ---
             name_match = re.search(r"Name:\s*(.*?)(?=\s+(Father|Gender|CNIC)|$)", full_text, re.IGNORECASE)
-            if name_match:
-                clean = name_match.group(1).strip()
-                if clean: data["Name"] = clean
+            if name_match: data["Name"] = name_match.group(1).strip()
 
             cnic_match = re.search(r"\d{5}-\d{7}-\d", full_text)
             if cnic_match: data["CNIC"] = cnic_match.group(0)
@@ -67,29 +42,29 @@ def parse_tasdeeq_pdf(file_stream):
             dob_match = re.search(r"Date of Birth:\s*(\d{2}/\d{2}/\d{4})", full_text)
             if dob_match: data["DOB"] = dob_match.group(1)
 
-            # --- FULL LOAN HISTORY ---
+            # --- Loan Parsing ---
             lines = full_text.split('\n')
             current_loan = {}
-            garbage_pattern = re.compile(r"^\d+\s?-\s?\d+$")
             capture_overdues = False
+            
+            # Patterns
+            new_loan_pattern = re.compile(r"^\d+\s?-\s?[A-Za-z]") 
+            garbage_pattern = re.compile(r"^\d+\s?-\s?\d+$")
 
             for line in lines:
                 line = line.strip()
-
-                # 1. Detect New Loan ("1- BANK NAME")
-                if re.match(r"^\d+\s?-\s?[A-Za-z]", line) and not garbage_pattern.match(line):
+                
+                # Detect New Loan Header
+                if new_loan_pattern.match(line) and not garbage_pattern.match(line):
                     if current_loan: data["Loans"].append(current_loan)
-
                     bank_part = line.split("-", 1)[1].strip() if "-" in line else line
                     current_loan = {
                         "Bank": bank_part, "Limit": 0, "Outstanding": 0, "MinDue": 0,
-                        "30": 0, "60": 0, "90": 0,
-                        "Start": "", "End": ""
+                        "30": 0, "60": 0, "90": 0, "Start": "", "End": ""
                     }
-                    capture_overdues = False 
+                    capture_overdues = False
 
                 if current_loan:
-                    # Amounts
                     if "Loan Limit:" in line:
                         val = re.search(r"[\d,]+", line.split("Limit:")[-1])
                         if val: current_loan["Limit"] = int(val.group(0).replace(",", ""))
@@ -99,21 +74,18 @@ def parse_tasdeeq_pdf(file_stream):
                     if "Min Amount Due:" in line:
                         val = re.search(r"[\d,]+", line.split("Due:")[-1])
                         if val: current_loan["MinDue"] = int(val.group(0).replace(",", ""))
-
-                    # Dates
                     if "Facility Date:" in line:
                         date_match = re.search(r"(\d{2}/\d{2}/\d{4})", line.split("Facility Date:")[-1])
                         if date_match: current_loan["Start"] = date_match.group(1)
                     if "Maturity Date:" in line:
                         date_match = re.search(r"(\d{2}/\d{2}/\d{4})", line.split("Maturity Date:")[-1])
                         if date_match: current_loan["End"] = date_match.group(1)
-
-                    # Overdues Logic
-                    if "SUMMARY OF OVERDUES" in line:
-                        capture_overdues = True
-
+                    
+                    # Overdue Table Logic
+                    if "SUMMARY OF OVERDUES" in line: capture_overdues = True
                     if capture_overdues and line.startswith("Times"):
                         nums = re.findall(r"\d+", line)
+                        # Expecting 30+, 60+, 90+
                         if len(nums) >= 3:
                             current_loan["30"] = int(nums[0])
                             current_loan["60"] = int(nums[1])
@@ -123,92 +95,93 @@ def parse_tasdeeq_pdf(file_stream):
             if current_loan: data["Loans"].append(current_loan)
 
     except Exception as e:
-        print(f"   ⚠️ Parsing Issue: {e}")
-        
+        st.error(f"Error Parsing PDF: {e}")
+    
     return data
 
-@app.route('/', methods=['GET'])
-def index():
-    return "DBR Processor is running."
-
-# Added strict_slashes=False to fix 405 error
-@app.route('/process', methods=['POST'], strict_slashes=False)
-def process_pdf():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'Filename is empty'}), 400
-
+# --- 3. EXCEL FILLER ---
+def fill_excel_template(customer_data, template_path="Template.xlsx"):
     try:
-        # 1. Parse PDF
-        customer_data = parse_tasdeeq_pdf(file)
+        wb = openpyxl.load_workbook(template_path)
+    except FileNotFoundError:
+        st.error("⚠️ CRITICAL ERROR: 'Template.xlsx' was not found in the GitHub repo.")
+        return None
+
+    ws = wb["INPUT"] # Target the INPUT sheet
+
+    # Fill Identity
+    ws['C6'] = customer_data.get("Name", "")
+    ws['C7'] = customer_data.get("CNIC", "")
+    ws['C8'] = customer_data.get("DOB", "")
+    
+    # Defaults
+    ws['H7'] = 0
+    ws['H8'] = 0
+    ws['C12'] = "[SELECT]"
+    ws['C13'] = "Salaried"
+
+    # Fill Grid (Start Row 19)
+    start_row = 19
+    current_row = start_row
+
+    for loan in customer_data["Loans"]:
+        # Logic to map Bank Name -> Product Code
+        p_code = get_product_code(loan["Bank"])
+        term_code = get_term_code(loan["Bank"])
+
+        # Write to Cells (Column Indices: A=1, B=2, C=3...)
+        ws.cell(row=current_row, column=2).value = "N"          # Col B
+        ws.cell(row=current_row, column=3).value = p_code       # Col C
+        ws.cell(row=current_row, column=4).value = term_code    # Col D
+        ws.cell(row=current_row, column=5).value = loan["Limit"] # Col E
+        # F is empty
+        ws.cell(row=current_row, column=7).value = loan["Outstanding"] # Col G
+        ws.cell(row=current_row, column=8).value = loan["MinDue"]      # Col H
         
-        # 2. Setup Google Drive/Sheets connection
-        creds = get_creds()
-        gc = gspread.authorize(creds)
-        drive_service = build('drive', 'v3', credentials=creds)
+        ws.cell(row=current_row, column=9).value = loan["30"]   # Col I
+        ws.cell(row=current_row, column=10).value = loan["60"]  # Col J
+        ws.cell(row=current_row, column=11).value = loan["90"]  # Col K
 
-        # 3. Create New Spreadsheet
-        # Sanitize filename
-        safe_name = customer_data['Name'].replace("/", "_")
-        if "NOT PROVIDED" in safe_name: safe_name = "Unknown_Customer"
-        new_file_name = f"DBR - {safe_name}"
+        ws.cell(row=current_row, column=12).value = loan["Start"] # Col L
+        ws.cell(row=current_row, column=13).value = loan["End"]   # Col M
 
-        # Copy the Master Template
-        copied_file = drive_service.files().copy(
-            fileId=MASTER_SHEET_ID,
-            body={"name": new_file_name}
-        ).execute()
-        new_sheet_id = copied_file.get('id')
+        current_row += 1
 
-        # 4. Write Data to the New Sheet
-        sh = gc.open_by_key(new_sheet_id)
-        ws = sh.worksheet(TARGET_TAB_NAME)
+    # Save to Buffer
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
 
-        updates = []
+# --- 4. UI LAYOUT ---
+st.title("🏦 TASDEEQ -> Excel Tool")
+st.markdown("Upload the PDF. Get the filled Excel file.")
 
-        # Identity & Defaults
-        updates.append({"range": "C6", "values": [[customer_data["Name"]]]})
-        updates.append({"range": "C7", "values": [[customer_data["CNIC"]]]})
-        updates.append({"range": "C8", "values": [[customer_data["DOB"]]]})
-        updates.append({"range": "C9", "values": [['=IF(C8<>"",DATEDIF(C8,TODAY(),"Y"),"")']]}) # Age
+uploaded_file = st.file_uploader("Drop Tasdeeq PDF Here", type="pdf")
 
-        updates.append({"range": "H7", "values": [[0]]})
-        updates.append({"range": "H8", "values": [[0]]})
-        updates.append({"range": "C12", "values": [["[SELECT]"]]})
-        updates.append({"range": "C13", "values": [["Salaried"]]})
+if uploaded_file:
+    with st.spinner("Reading PDF..."):
+        # 1. Parse
+        data = parse_tasdeeq_pdf(uploaded_file)
+        
+        if data["Loans"]:
+            st.success(f"✅ Extracted {len(data['Loans'])} loans for **{data['Name']}**")
+            
+            # 2. Fill Excel
+            excel_file = fill_excel_template(data)
+            
+            if excel_file:
+                # 3. Create Safe Filename
+                safe_name = str(data['Name']).replace("/", "_").replace(" ", "_")
+                file_name = f"DBR_{safe_name}.xlsx"
 
-        # Loan Grid
-        start_row = 19
-        loan_rows = []
-
-        for loan in customer_data["Loans"]:
-            p_code = get_product_code(loan["Bank"])
-            term_code = get_term_code(loan["Bank"])
-
-            # Map to Sheet Columns (B through M)
-            row_data = [
-                "N", p_code, term_code, loan["Limit"], "", loan["Outstanding"],
-                loan["MinDue"], loan["30"], loan["60"], loan["90"],
-                loan["Start"], loan["End"]
-            ]
-            loan_rows.append(row_data)
-
-        if loan_rows:
-            end_row = start_row + len(loan_rows) - 1
-            updates.append({"range": f"B{start_row}:M{end_row}", "values": loan_rows})
-
-        ws.batch_update(updates, value_input_option="USER_ENTERED")
-
-        # Return the link
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{new_sheet_id}/edit"
-        return jsonify({'status': 'success', 'sheet_url': sheet_url})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+                # 4. Download Button
+                st.download_button(
+                    label="⬇️ DOWNLOAD EXCEL FILE",
+                    data=excel_file,
+                    file_name=file_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+        else:
+            st.warning("Parsed the PDF, but found no loans. Is this a valid Tasdeeq report?")
