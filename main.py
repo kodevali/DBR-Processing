@@ -10,22 +10,21 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-# Ensure these match your actual IDs and environment variables
 MASTER_SHEET_ID = "1cY6O1tDlkCRaTE9eYlqZ-culLKR2Y6Q2uHzmcuJ5Gg4"
-# Assuming 'INPUT' tab has a specific ID or name you want to target.
-# If copying the whole file, we just need to know which tab to write to.
 TARGET_TAB_NAME = "INPUT" 
 
 # --- AUTHENTICATION ---
-# We use the environment variable GOOGLE_CREDENTIALS for the service account json
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
 def get_creds():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if not creds_json:
         raise ValueError("GOOGLE_CREDENTIALS environment variable not set")
-    creds_dict = json.loads(creds_json)
-    return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    try:
+        creds_dict = json.loads(creds_json)
+        return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    except Exception as e:
+        raise ValueError(f"Invalid GOOGLE_CREDENTIALS JSON: {str(e)}")
 
 # --- MAPPING LOGIC ---
 def get_product_code(text):
@@ -41,7 +40,7 @@ def get_term_code(text):
     if "card" in t or "running" in t or "cash line" in t: return "E"
     return "T"
 
-# --- PDF PARSER ---
+# --- PDF PARSER (YOUR EXACT LOGIC) ---
 def parse_tasdeeq_pdf(file_stream):
     data = {
         "Name": "[[ NOT PROVIDED ]]",
@@ -125,7 +124,6 @@ def parse_tasdeeq_pdf(file_stream):
 
     except Exception as e:
         print(f"   ⚠️ Parsing Issue: {e}")
-        # We return partial data if something failed, or empty structure
         
     return data
 
@@ -133,14 +131,15 @@ def parse_tasdeeq_pdf(file_stream):
 def index():
     return "DBR Processor is running."
 
-@app.route('/process', methods=['POST'])
+# Added strict_slashes=False to fix 405 error
+@app.route('/process', methods=['POST'], strict_slashes=False)
 def process_pdf():
     if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+        return jsonify({'error': 'No file uploaded'}), 400
     
     file = request.files['file']
     if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+        return jsonify({'error': 'Filename is empty'}), 400
 
     try:
         # 1. Parse PDF
