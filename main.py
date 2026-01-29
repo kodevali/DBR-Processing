@@ -15,8 +15,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 # 1. CONFIGURATION (YOU MUST FILL THESE)
 # ==========================================
 # Open your Google Drive Folder -> Look at the URL -> Copy the ID after /folders/
-INPUT_FOLDER_ID = "1wU3Kb_k4TwulUg-Q6r0NGy9iOe89Z0Gv"      # e.g., "1bP_xyz..."
-PROCESSED_FOLDER_ID = "10owRvXdMHTaenqsmN0PbU1rTOsqfVkxq"  # e.g., "1cQ_abc..."
+INPUT_FOLDER_ID = "1jSMYN7umq9B2jdh5agzzb7ZBzcDg_-rQ"      # e.g., "1bP_xyz..."
+PROCESSED_FOLDER_ID = "1KbSp42_KSLht30MCrY5jSodENdKypWw9"  # e.g., "1cQ_abc..."
 MASTER_SHEET_ID = "1cY6O1tDlkCRaTE9eYlqZ-culLKR2Y6Q2uHzmcuJ5Gg4" 
 TEMPLATE_TAB_ID = 291296153 # The ID of the "INPUT" tab you want to clone
 
